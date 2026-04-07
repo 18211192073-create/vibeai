@@ -204,6 +204,23 @@ def _is_vercel_env() -> bool:
     return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
 
 
+def _candidate_api_key_env_names(*preferred: str) -> List[str]:
+    """返回按优先级排序的 API Key 环境变量名列表（自动去重）。"""
+    ordered: List[str] = []
+    for name in [
+        *preferred,
+        "AI_API_KEY",
+        "OPENAI_API_KEY",
+        "VOLC_API_KEY",
+        "ARK_API_KEY",
+        "DOUBAO_API_KEY",
+    ]:
+        env_name = str(name or "").strip()
+        if env_name and env_name not in ordered:
+            ordered.append(env_name)
+    return ordered
+
+
 def _resolve_ai_api_key(*env_names: str) -> str:
     for name in env_names:
         value = os.environ.get(name, "")
@@ -998,11 +1015,10 @@ def build_reading_log_draft(
     user_prompt = user_prompt.replace("{existing_logs_json}", existing_logs_json)
 
     api_key = _resolve_ai_api_key(
-        reading_cfg.get("api_key_env", assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY")),
-        assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY"),
-        "AI_API_KEY",
-        "OPENAI_API_KEY",
-        "VOLC_API_KEY",
+        *_candidate_api_key_env_names(
+            reading_cfg.get("api_key_env", assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY")),
+            assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY"),
+        )
     )
     if not api_key:
         summary_text = _truncate(item.get("summary", "") or item.get("title", ""), 220)
@@ -1136,10 +1152,7 @@ def build_daily_digest(
 
     ai_cfg = assistant_settings.get("ai", {})
     api_key = _resolve_ai_api_key(
-        ai_cfg.get("api_key_env", "VOLC_API_KEY"),
-        "AI_API_KEY",
-        "OPENAI_API_KEY",
-        "VOLC_API_KEY",
+        *_candidate_api_key_env_names(ai_cfg.get("api_key_env", "VOLC_API_KEY"))
     )
     if not api_key:
         result = _heuristic_digest(candidates, max_items, app_name=app_name, empty_hint=empty_hint)

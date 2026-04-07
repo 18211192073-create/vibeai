@@ -65,12 +65,29 @@ def _should_force_recollect(existing_report: Dict[str, Any] | None, assistant_se
 
 
 def _has_ai_key(assistant_settings: Dict[str, Any]) -> tuple[bool, str]:
-    ai_cfg = assistant_settings.get("ai", {}) or {}
-    preferred = str(ai_cfg.get("api_key_env", "VOLC_API_KEY")).strip() or "VOLC_API_KEY"
-    for env_name in [preferred, "AI_API_KEY", "OPENAI_API_KEY", "VOLC_API_KEY"]:
+    env_names = _candidate_api_key_env_names(assistant_settings)
+    for env_name in env_names:
         if os.environ.get(env_name):
             return True, env_name
-    return False, preferred
+    return False, env_names[0] if env_names else "VOLC_API_KEY"
+
+
+def _candidate_api_key_env_names(assistant_settings: Dict[str, Any]) -> list[str]:
+    ai_cfg = assistant_settings.get("ai", {}) or {}
+    preferred = str(ai_cfg.get("api_key_env", "VOLC_API_KEY")).strip() or "VOLC_API_KEY"
+    ordered: list[str] = []
+    for env_name in [
+        preferred,
+        "AI_API_KEY",
+        "OPENAI_API_KEY",
+        "VOLC_API_KEY",
+        "ARK_API_KEY",
+        "DOUBAO_API_KEY",
+    ]:
+        normalized = str(env_name or "").strip()
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
 
 
 def _default_output_dir() -> Path:
@@ -195,6 +212,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             storage = self._get_storage()
             latest_report = storage.get_latest_report()
             ai_key_present, ai_key_env = _has_ai_key(self.assistant_settings)
+            ai_key_candidates = _candidate_api_key_env_names(self.assistant_settings)
             force_recollect = _should_force_recollect(latest_report, self.assistant_settings)
             live_probe = []
             if _is_vercel_env():
@@ -213,6 +231,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
                         "force_recollect_now": force_recollect,
                         "ai_key_present": ai_key_present,
                         "ai_key_env_used": ai_key_env,
+                        "ai_key_candidates": ai_key_candidates,
                     },
                     "latest_report": {
                         "exists": bool(latest_report),
