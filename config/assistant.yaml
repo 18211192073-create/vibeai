@@ -1,0 +1,147 @@
+# DAY VIBE AI 配置
+#
+# 这里是一个可直接修改的默认配置文件。
+# 你可以按自己的关注源和部署方式调整 source 白名单。
+
+enabled: true
+app_name: "DAY VIBE AI"
+auto_refresh_on_empty: true
+report_time: "17:00"
+timezone: "Asia/Shanghai"
+lookback_hours: 24
+candidate_limit: 60
+max_items: 8
+title_style: "analysis"
+
+sources:
+  # 热榜来源白名单：会优先从这些平台中找 AI 行业内容
+  platform_ids:
+    - wallstreetcn-hot
+    - zhihu
+    - weibo
+    - douyin
+    - bilibili-hot-search
+    - thepaper
+    - hacker-news
+    - yahoo-finance
+
+  # RSS 来源白名单：如果你后续新增 AI 订阅源，可把 id 加到这里
+  rss_ids:
+    - openai-news
+    - google-blog
+    - deepmind-blog
+    - the-verge
+    - wired-ai
+    - meta-tech-innovation
+    - meta-product-news
+    - anthropic-news
+    - hacker-news
+    - yahoo-finance
+
+  # 标题关键词白名单：命中这些词的内容会被视为 AI 相关候选
+  title_keywords:
+    - AI
+    - 人工智能
+    - 大模型
+    - LLM
+    - Agent
+    - 智能体
+    - OpenAI
+    - Anthropic
+    - Google DeepMind
+    - DeepSeek
+    - 火山引擎
+    - 豆包
+    - NVIDIA
+    - GPU
+    - 推理
+    - RAG
+    - AIGC
+    - Copilot
+    - Meta AI
+
+  # 科技相关补充词：用于捕捉 AI 以外但仍属于科技主航道的内容
+  tech_keywords:
+    - 科技
+    - 技术
+    - 芯片
+    - 半导体
+    - 算力
+    - 机器人
+    - 自动驾驶
+    - 云计算
+    - 开源
+    - 编程
+    - 软件
+    - 模型
+    - Windows
+    - iPhone
+    - 苹果
+    - 谷歌
+    - 微软
+    - 华为
+    - 阿里
+    - 腾讯
+    - 字节
+    - 英伟达
+
+  # 明确排除的噪音词：出现这些词时通常优先剔除
+  exclude_keywords:
+    - 娱乐
+    - 明星
+    - 八卦
+    - 综艺
+    - 影视
+    - 体育
+    - 足球
+    - 篮球
+    - 情感
+    - 旅游
+    - 美食
+    - 健康
+    - 社会
+    - 国际
+    - 战争
+
+source_priority:
+  enabled: true
+  boosts:
+    openai blog: 24
+    openai x: 23
+    openai: 22
+    anthropic: 20
+    google deepmind: 20
+    deepmind: 18
+    meta ai: 17
+    the verge: 14
+    wired: 14
+    axios: 14
+    google: 12
+    techcrunch: 10
+    hacker news: 8
+  downweights:
+    zhihu: -12
+    weibo: -8
+    douyin: -8
+    bilibili: -5
+
+feishu:
+  enabled: false
+  webhook_url: ""
+  # 如果你后续把网页部署到内网/公网，可以把可访问地址填到这里。
+  dashboard_url: "http://127.0.0.1:8080"
+
+ai:
+  # Ark OpenAI 兼容接口
+  model: "openai/doubao-seed-2-0-code-preview-260215"
+  api_base: "https://ark.cn-beijing.volces.com/api/v3"
+  api_key_env: "VOLC_API_KEY"
+  temperature: 0.35
+  max_tokens: 3500
+  timeout: 120
+
+reading_log:
+  enabled: true
+  prompt_file: "config/ai_reading_log_prompt.txt"
+  temperature: 0.55
+  max_tokens: 1800
