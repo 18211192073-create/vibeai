@@ -200,6 +200,27 @@ def _default_output_dir() -> Path:
     return Path(os.environ.get("DAY_VIBE_OUTPUT_DIR", "output/assistant"))
 
 
+def _is_vercel_env() -> bool:
+    return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+
+
+def _candidate_api_key_env_names(*preferred: str) -> List[str]:
+    """返回按优先级排序的 API Key 环境变量名列表（自动去重）。"""
+    ordered: List[str] = []
+    for name in [
+        *preferred,
+        "AI_API_KEY",
+        "OPENAI_API_KEY",
+        "VOLC_API_KEY",
+        "ARK_API_KEY",
+        "DOUBAO_API_KEY",
+    ]:
+        env_name = str(name or "").strip()
+        if env_name and env_name not in ordered:
+            ordered.append(env_name)
+    return ordered
+
+
 def _resolve_ai_api_key(*env_names: str) -> str:
     for name in env_names:
         value = os.environ.get(name, "")
@@ -614,11 +635,119 @@ def collect_candidates(lookback_hours: int = 24, assistant_settings: Optional[Di
     return sorted(dedup.values(), key=lambda item: (item.importance_hint, item.published_at), reverse=True)
 
 
+def collect_live_rss_candidates(
+    lookback_hours: int = 24,
+    assistant_settings: Optional[Dict[str, Any]] = None,
+    max_feeds: int = 4,
+) -> List[DigestCandidate]:
+    """在线实时抓取 RSS 候选（用于 Vercel 刷新）。"""
+    assistant_settings = assistant_settings or {}
+    assistant_sources = assistant_settings.get("sources", {}) or {}
+    source_priority = assistant_settings.get("source_priority", {}) or {}
+    timezone = assistant_settings.get("timezone", DEFAULT_TIMEZONE)
+    rss_whitelist = set(assistant_sources.get("rss_ids", []) or [])
+
+    config_path = Path("config/config.yaml")
+    if not config_path.exists():
+        return []
+    try:
+        config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return []
+
+    rss_cfg = config_data.get("rss", {}) or config_data.get("RSS", {}) or {}
+    feeds = [feed for feed in (rss_cfg.get("feeds", []) or []) if feed.get("enabled", True)]
+    if rss_whitelist:
+        feeds = [feed for feed in feeds if feed.get("id") in rss_whitelist]
+
+    preferred_ids = [
+        "openai-news",
+        "anthropic-news",
+        "deepmind-blog",
+        "google-blog",
+        "meta-tech-innovation",
+        "meta-product-news",
+        "the-verge",
+        "wired-ai",
+        "hacker-news",
+        "axios",
+    ]
+    order = {feed_id: idx for idx, feed_id in enumerate(preferred_ids)}
+    feeds.sort(key=lambda feed: order.get(feed.get("id", ""), 999))
+    feeds = feeds[:max_feeds]
+    if not feeds:
+        return []
+
+    try:
+        from trendradar.crawler.rss.fetcher import RSSFetcher
+    except Exception:
+        return []
+
+    runtime_rss_config = {
+        "feeds": feeds,
+        "request_interval": 50,
+        "timeout": 4,
+        "use_proxy": False,
+        "timezone": timezone,
+        "freshness_filter": {"enabled": True, "max_age_days": 2},
+    }
+
+    try:
+        fetcher = RSSFetcher.from_config(runtime_rss_config)
+        rss_data = fetcher.fetch_all()
+    except Exception:
+        return []
+
+    now = get_configured_time(timezone)
+    cutoff = now - timedelta(hours=lookback_hours)
+    candidates: List[DigestCandidate] = []
+
+    for feed_id, items in (rss_data.items or {}).items():
+        for rss_item in items or []:
+            title = _normalize_text(getattr(rss_item, "title", "") or "")
+            source_name = getattr(rss_item, "feed_name", "") or feed_id or "RSS"
+            source_url = getattr(rss_item, "url", "") or ""
+            summary = _truncate(getattr(rss_item, "summary", "") or title, 220)
+            published_at = getattr(rss_item, "published_at", "") or ""
+
+            parsed_time = _safe_parse_datetime(published_at)
+            if parsed_time and parsed_time < cutoff:
+                continue
+            if not _is_ai_related(title, source_name, feed_id, assistant_sources):
+                continue
+
+            importance_hint = 70.0 + _source_priority_boost(source_name, feed_id, source_priority)
+            candidates.append(
+                DigestCandidate(
+                    item_id=_make_item_id("rss-live", feed_id, source_url, title),
+                    source_type="rss",
+                    source_name=source_name,
+                    title=title,
+                    original_title=title,
+                    summary=summary,
+                    source_url=source_url,
+                    image_url="",
+                    published_at=published_at,
+                    importance_hint=importance_hint,
+                    raw={
+                        "source_id": feed_id,
+                        "author": getattr(rss_item, "author", "") or "",
+                        "crawl_time": getattr(rss_item, "crawl_time", "") or "",
+                    },
+                )
+            )
+
+    dedup: Dict[str, DigestCandidate] = {}
+    for candidate in candidates:
+        dedup[candidate.item_id] = candidate
+    return sorted(dedup.values(), key=lambda item: (item.importance_hint, item.published_at), reverse=True)
+
+
 def _attempt_auto_refresh(assistant_settings: Dict[str, Any]) -> Dict[str, Any]:
     """在日报为空时尝试自动补跑一次采集。"""
     global _AUTO_REFRESH_ATTEMPTED
 
-    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+    if _is_vercel_env():
         return {
             "attempted": False,
             "success": False,
@@ -886,11 +1015,10 @@ def build_reading_log_draft(
     user_prompt = user_prompt.replace("{existing_logs_json}", existing_logs_json)
 
     api_key = _resolve_ai_api_key(
-        reading_cfg.get("api_key_env", assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY")),
-        assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY"),
-        "AI_API_KEY",
-        "OPENAI_API_KEY",
-        "VOLC_API_KEY",
+        *_candidate_api_key_env_names(
+            reading_cfg.get("api_key_env", assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY")),
+            assistant_settings.get("ai", {}).get("api_key_env", "VOLC_API_KEY"),
+        )
     )
     if not api_key:
         summary_text = _truncate(item.get("summary", "") or item.get("title", ""), 220)
@@ -983,16 +1111,36 @@ def build_daily_digest(
     assistant_config_path: str = "config/assistant.yaml",
     assistant_settings: Optional[Dict[str, Any]] = None,
     storage: Optional[AssistantStorage] = None,
+    injected_candidates: Optional[List[DigestCandidate]] = None,
+    replace_candidates: bool = False,
 ) -> Dict[str, Any]:
     """生成日报、保存到本地，并返回结构化数据。"""
     assistant_settings = assistant_settings or load_assistant_settings(assistant_config_path)
     storage = storage or AssistantStorage()
     app_name = str(assistant_settings.get("app_name", "DAY VIBE AI"))
     empty_hint = "当前没有可用候选新闻，请先运行采集任务。"
+    if _is_vercel_env():
+        empty_hint = "当前没有可用候选新闻，正在尝试实时抓取最新 AI/科技 RSS 数据。"
 
     lookback_hours = int(assistant_settings.get("lookback_hours", 24))
     max_items = int(assistant_settings.get("max_items", 8))
     candidates = collect_candidates(lookback_hours=lookback_hours, assistant_settings=assistant_settings)
+    if injected_candidates:
+        if replace_candidates:
+            candidates = list(injected_candidates)
+        else:
+            merged: Dict[str, DigestCandidate] = {item.item_id: item for item in candidates}
+            for item in injected_candidates:
+                merged[item.item_id] = item
+            candidates = sorted(merged.values(), key=lambda item: (item.importance_hint, item.published_at), reverse=True)
+    elif not candidates and _is_vercel_env():
+        live_candidates = collect_live_rss_candidates(
+            lookback_hours=lookback_hours,
+            assistant_settings=assistant_settings,
+        )
+        if live_candidates:
+            candidates = live_candidates
+            empty_hint = f"已实时抓取并生成 {len(candidates)} 条候选新闻。"
 
     now = get_configured_time(assistant_settings.get("timezone", DEFAULT_TIMEZONE))
     report_date = now.strftime("%Y-%m-%d")
@@ -1004,10 +1152,7 @@ def build_daily_digest(
 
     ai_cfg = assistant_settings.get("ai", {})
     api_key = _resolve_ai_api_key(
-        ai_cfg.get("api_key_env", "VOLC_API_KEY"),
-        "AI_API_KEY",
-        "OPENAI_API_KEY",
-        "VOLC_API_KEY",
+        *_candidate_api_key_env_names(ai_cfg.get("api_key_env", "VOLC_API_KEY"))
     )
     if not api_key:
         result = _heuristic_digest(candidates, max_items, app_name=app_name, empty_hint=empty_hint)

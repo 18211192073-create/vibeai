@@ -17,12 +17,81 @@ from pathlib import Path
 from typing import Any, Dict
 from urllib.parse import parse_qs, urlparse
 
-from .digest import build_daily_digest, build_reading_log_draft, load_assistant_settings, render_report_html
+from trendradar.utils.time import DEFAULT_TIMEZONE, get_configured_time
+
+from .digest import (
+    build_daily_digest,
+    build_reading_log_draft,
+    collect_live_rss_candidates,
+    load_assistant_settings,
+    render_report_html,
+)
 from .storage import AssistantStorage
 
 
+def _is_vercel_env() -> bool:
+    return bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
+
+
+def _parse_report_time(value: str) -> tuple[int, int]:
+    text = (value or "17:00").strip()
+    try:
+        hour_str, minute_str = text.split(":", 1)
+        hour = max(0, min(23, int(hour_str)))
+        minute = max(0, min(59, int(minute_str)))
+        return hour, minute
+    except Exception:
+        return 17, 0
+
+
+def _should_force_recollect(existing_report: Dict[str, Any] | None, assistant_settings: Dict[str, Any]) -> bool:
+    timezone = assistant_settings.get("timezone", DEFAULT_TIMEZONE)
+    now = get_configured_time(timezone)
+    today = now.strftime("%Y-%m-%d")
+    report_time_hour, report_time_minute = _parse_report_time(str(assistant_settings.get("report_time", "17:00")))
+    passed_report_time = (now.hour, now.minute) >= (report_time_hour, report_time_minute)
+
+    if not existing_report:
+        return True
+
+    existing_date = str(existing_report.get("report_date", "")).strip()
+    if existing_date != today:
+        return True
+
+    if passed_report_time:
+        return True
+
+    return False
+
+
+def _has_ai_key(assistant_settings: Dict[str, Any]) -> tuple[bool, str]:
+    env_names = _candidate_api_key_env_names(assistant_settings)
+    for env_name in env_names:
+        if os.environ.get(env_name):
+            return True, env_name
+    return False, env_names[0] if env_names else "VOLC_API_KEY"
+
+
+def _candidate_api_key_env_names(assistant_settings: Dict[str, Any]) -> list[str]:
+    ai_cfg = assistant_settings.get("ai", {}) or {}
+    preferred = str(ai_cfg.get("api_key_env", "VOLC_API_KEY")).strip() or "VOLC_API_KEY"
+    ordered: list[str] = []
+    for env_name in [
+        preferred,
+        "AI_API_KEY",
+        "OPENAI_API_KEY",
+        "VOLC_API_KEY",
+        "ARK_API_KEY",
+        "DOUBAO_API_KEY",
+    ]:
+        normalized = str(env_name or "").strip()
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
+
+
 def _default_output_dir() -> Path:
-    if os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"):
+    if _is_vercel_env():
         return Path(os.environ.get("DAY_VIBE_OUTPUT_DIR", "/tmp/day-vibe-ai/assistant"))
     return Path(os.environ.get("DAY_VIBE_OUTPUT_DIR", "output/assistant"))
 
@@ -56,14 +125,38 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _resolve_effective_path(self, parsed) -> tuple[str, Dict[str, list[str]]]:
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        path = parsed.path
+        if path == "/api/index.py":
+            forwarded = (query.get("path") or query.get("__path") or [None])[0]
+            if forwarded:
+                path = urlparse(forwarded).path or forwarded
+            else:
+                path = "/"
+        return path, query
+
     def _ensure_latest_report(self) -> Dict[str, Any]:
         storage = self._get_storage()
         report = storage.get_latest_report()
-        if report:
+        if report and not _should_force_recollect(report, self.assistant_settings):
             report["bookmarks"] = storage.list_bookmarks()
             report["logs"] = storage.list_reading_logs()
             return report
-        report = build_daily_digest(assistant_settings=self.assistant_settings, storage=storage)
+        injected_candidates = None
+        replace_candidates = False
+        if _is_vercel_env():
+            injected_candidates = collect_live_rss_candidates(
+                lookback_hours=int(self.assistant_settings.get("lookback_hours", 24)),
+                assistant_settings=self.assistant_settings,
+            )
+            replace_candidates = bool(injected_candidates)
+        report = build_daily_digest(
+            assistant_settings=self.assistant_settings,
+            storage=storage,
+            injected_candidates=injected_candidates,
+            replace_candidates=replace_candidates,
+        )
         report["bookmarks"] = storage.list_bookmarks()
         report["logs"] = storage.list_reading_logs()
         return report
@@ -100,7 +193,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        path = parsed.path
+        path, query = self._resolve_effective_path(parsed)
 
         if path in {"/", "/index.html"}:
             self._serve_dashboard()
@@ -115,6 +208,46 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "report": report})
             return
 
+        if path == "/api/runtime-check":
+            storage = self._get_storage()
+            latest_report = storage.get_latest_report()
+            ai_key_present, ai_key_env = _has_ai_key(self.assistant_settings)
+            ai_key_candidates = _candidate_api_key_env_names(self.assistant_settings)
+            force_recollect = _should_force_recollect(latest_report, self.assistant_settings)
+            live_probe = []
+            if _is_vercel_env():
+                live_probe = collect_live_rss_candidates(
+                    lookback_hours=int(self.assistant_settings.get("lookback_hours", 24)),
+                    assistant_settings=self.assistant_settings,
+                    max_feeds=2,
+                )
+            self._send_json(
+                {
+                    "ok": True,
+                    "runtime": {
+                        "is_vercel": _is_vercel_env(),
+                        "report_time": str(self.assistant_settings.get("report_time", "17:00")),
+                        "timezone": str(self.assistant_settings.get("timezone", DEFAULT_TIMEZONE)),
+                        "force_recollect_now": force_recollect,
+                        "ai_key_present": ai_key_present,
+                        "ai_key_env_used": ai_key_env,
+                        "ai_key_candidates": ai_key_candidates,
+                    },
+                    "latest_report": {
+                        "exists": bool(latest_report),
+                        "report_date": (latest_report or {}).get("report_date", ""),
+                        "generated_at": (latest_report or {}).get("generated_at", ""),
+                        "item_count": len((latest_report or {}).get("items", []) or []),
+                        "generator": ((latest_report or {}).get("assistant", {}) or {}).get("generator", ""),
+                    },
+                    "live_probe": {
+                        "candidate_count": len(live_probe),
+                        "sample_sources": sorted(list({item.source_name for item in live_probe}))[:5],
+                    },
+                }
+            )
+            return
+
         if path == "/api/reports":
             self._send_json({"ok": True, "reports": self._get_storage().list_reports()})
             return
@@ -124,13 +257,11 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/logs":
-            query = parse_qs(parsed.query)
             item_id = (query.get("item_id") or [None])[0]
             self._send_json({"ok": True, "logs": self._get_storage().list_reading_logs(item_id=item_id)})
             return
 
         if path == "/api/item":
-            query = parse_qs(parsed.query)
             item_id = (query.get("item_id") or [None])[0]
             if not item_id:
                 self._send_json({"ok": False, "error": "missing item_id"}, status=400)
@@ -164,28 +295,105 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        path, _query = self._resolve_effective_path(parsed)
         body = self._read_json_body()
 
-        if parsed.path == "/api/refresh":
+        if path == "/api/refresh":
             started_at = time.time()
-            try:
-                from mcp_server.tools.system import SystemManagementTools
+            storage = self._get_storage()
+            latest_report = storage.get_latest_report()
+            must_recollect = _should_force_recollect(latest_report, self.assistant_settings)
 
-                project_root = str(Path(__file__).resolve().parents[2])
-                crawl_result = SystemManagementTools(project_root=project_root).trigger_crawl(
-                    save_to_local=True,
-                    include_url=False,
+            if not must_recollect:
+                report = latest_report or build_daily_digest(
+                    assistant_settings=self.assistant_settings,
+                    storage=storage,
                 )
-            except Exception as exc:
-                self._send_json({"ok": False, "error": f"抓取失败: {exc}"}, status=500)
+                report["bookmarks"] = storage.list_bookmarks()
+                report["logs"] = storage.list_reading_logs()
+                elapsed_seconds = max(1, round(time.time() - started_at))
+                self._send_json(
+                    {
+                        "ok": True,
+                        "crawl": {
+                            "success": True,
+                            "mode": "cache-hit-before-cutoff",
+                            "note": "当前时间在日报时间点之前，使用当日已有数据。",
+                        },
+                        "integration": {
+                            "ai_key_present": _has_ai_key(self.assistant_settings)[0],
+                            "path": "cache-hit-before-cutoff",
+                        },
+                        "report": report,
+                        "elapsed_seconds": elapsed_seconds,
+                    }
+                )
                 return
 
-            report = build_daily_digest(assistant_settings=self.assistant_settings, storage=self._get_storage())
+            crawl_result: Dict[str, Any]
+            crawl_warning = ""
+
+            if _is_vercel_env():
+                live_candidates = collect_live_rss_candidates(
+                    lookback_hours=int(self.assistant_settings.get("lookback_hours", 24)),
+                    assistant_settings=self.assistant_settings,
+                )
+                crawl_result = {
+                    "success": bool(live_candidates),
+                    "mode": "vercel-live-rss",
+                    "fetched_candidates": len(live_candidates),
+                    "note": "Vercel 环境已执行实时 RSS 抓取并刷新日报。",
+                }
+                report = build_daily_digest(
+                    assistant_settings=self.assistant_settings,
+                    storage=storage,
+                    injected_candidates=live_candidates,
+                    replace_candidates=True,
+                )
+                integration_path = "vercel-live-rss"
+            else:
+                try:
+                    from mcp_server.tools.system import SystemManagementTools
+
+                    project_root = str(Path(__file__).resolve().parents[2])
+                    crawl_result = SystemManagementTools(project_root=project_root).trigger_crawl(
+                        save_to_local=True,
+                        include_url=False,
+                    )
+                except Exception as exc:
+                    crawl_warning = f"抓取失败，已回退到本地数据刷新：{exc}"
+                    crawl_result = {
+                        "success": False,
+                        "mode": "local-fallback",
+                        "note": crawl_warning,
+                    }
+                report = build_daily_digest(
+                    assistant_settings=self.assistant_settings,
+                    storage=storage,
+                )
+                integration_path = "local-crawler"
+
+            if crawl_warning:
+                report["brief"] = f"{crawl_warning}；{report.get('brief', '')}".strip("；")
+            report["bookmarks"] = storage.list_bookmarks()
+            report["logs"] = storage.list_reading_logs()
             elapsed_seconds = max(1, round(time.time() - started_at))
-            self._send_json({"ok": True, "crawl": crawl_result, "report": report, "elapsed_seconds": elapsed_seconds})
+            self._send_json(
+                {
+                    "ok": True,
+                    "crawl": crawl_result,
+                    "integration": {
+                        "ai_key_present": _has_ai_key(self.assistant_settings)[0],
+                        "path": integration_path,
+                        "report_generator": (report.get("assistant", {}) or {}).get("generator", ""),
+                    },
+                    "report": report,
+                    "elapsed_seconds": elapsed_seconds,
+                }
+            )
             return
 
-        if parsed.path == "/api/bookmarks":
+        if path == "/api/bookmarks":
             item_id = body.get("item_id")
             title = body.get("title", "")
             report_id = body.get("report_id", "")
@@ -219,7 +427,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **result})
             return
 
-        if parsed.path == "/api/logs":
+        if path == "/api/logs":
             item_id = body.get("item_id")
             log_text = (body.get("log_text") or "").strip()
             draft_text = (body.get("draft_text") or "").strip()
@@ -238,7 +446,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, **result})
             return
 
-        if parsed.path == "/api/log-draft":
+        if path == "/api/log-draft":
             item_id = body.get("item_id")
             if not item_id:
                 self._send_json({"ok": False, "error": "missing item_id"}, status=400)
@@ -257,7 +465,7 @@ class AssistantHTTPRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "draft": draft})
             return
 
-        if parsed.path == "/api/generate":
+        if path == "/api/generate":
             report = build_daily_digest(assistant_settings=self.assistant_settings, storage=self._get_storage())
             self._send_json({"ok": True, "report": report})
             return

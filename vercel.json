@@ -1,5 +1,11 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/**/*.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{.venv/**,**/__pycache__/**,tests/**,__tests__/**,docs/**,.github/**,scripts/**}"
+    }
+  },
   "builds": [
     {
       "src": "api/index.py",
@@ -8,9 +14,12 @@
   ],
   "rewrites": [
     {
-      "source": "/(.*)",
-      "destination": "/api/index.py"
+      "source": "/api/:path*",
+      "destination": "/api/index.py?path=/api/:path*"
+    },
+    {
+      "source": "/:path*",
+      "destination": "/api/index.py?path=/:path*"
     }
   ]
 }
-
