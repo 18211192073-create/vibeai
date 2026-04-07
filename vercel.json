@@ -6,12 +6,6 @@
       "excludeFiles": "{.venv/**,**/__pycache__/**,tests/**,__tests__/**,docs/**,.github/**,scripts/**}"
     }
   },
-  "builds": [
-    {
-      "src": "api/index.py",
-      "use": "@vercel/python"
-    }
-  ],
   "rewrites": [
     {
       "source": "/api/:path*",
